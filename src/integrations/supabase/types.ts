@@ -37,6 +37,60 @@ export type Database = {
           user_id?: string
         }
         Relationships: []
+      },
+      // Added: bills table types for persistence
+      bills: {
+        Row: {
+          id: string
+          user_id: string
+          beneficiary: string
+          amount: number
+          due_date: string
+          status: string | null
+          category: string | null
+          payment_method: string | null
+          paid_at: string | null
+          barcode: string | null
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          beneficiary: string
+          amount: number
+          due_date: string
+          status?: string | null
+          category?: string | null
+          payment_method?: string | null
+          paid_at?: string | null
+          barcode?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          beneficiary?: string
+          amount?: number
+          due_date?: string
+          status?: string | null
+          category?: string | null
+          payment_method?: string | null
+          paid_at?: string | null
+          barcode?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "bills_user_id_fkey",
+            columns: ["user_id"],
+            isOneToOne: false,
+            referencedRelation: "users",
+            referencedColumns: ["id"]
+          }
+        ]
       }
     }
     Views: {

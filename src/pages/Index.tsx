@@ -14,6 +14,10 @@ import { DollarSign, CreditCard, TrendingUp, Calendar, Settings, LogOut } from "
 import { Link } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { supabase } from "@/integrations/supabase/client";
+import { Tables } from "@/integrations/supabase/types";
+
 // Mock data for demonstration
 const mockBills: Bill[] = [
   {
@@ -84,15 +88,108 @@ const mockPaymentHistoryWithCategories: MonthlyPaymentData[] = [
 const Index = () => {
   const { user, loading, signOut } = useAuth();
   const navigate = useNavigate();
-  const [bills, setBills] = useState<Bill[]>(mockBills);
+  // const [bills, setBills] = useState<Bill[]>(mockBills);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [selectedMonth, setSelectedMonth] = useState<string | null>(null);
+
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     if (!loading && !user) {
       navigate('/auth');
     }
   }, [user, loading, navigate]);
+
+  // Map DB row -> UI Bill
+  const mapRowToBill = (row: Tables<'bills'>): Bill => ({
+    id: row.id,
+    beneficiary: row.beneficiary,
+    amount: row.amount,
+    dueDate: row.due_date,
+    status: (row.status as 'pending' | 'paid') ?? 'pending',
+    category: row.category ?? undefined,
+    paymentMethod: (row.payment_method as Bill['paymentMethod']) ?? undefined,
+    paidAt: row.paid_at ?? undefined,
+    barcode: row.barcode ?? undefined,
+  });
+
+  // Fetch bills from Supabase for the current user
+  const { data: dbBills = [], isLoading: billsLoading } = useQuery({
+    queryKey: ['bills', user?.id],
+    enabled: !!user,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('bills')
+        .select('*')
+        .eq('user_id', user!.id)
+        .order('due_date', { ascending: true });
+      if (error) throw new Error(error.message);
+      return data as Tables<'bills'>[];
+    }
+  });
+
+  const bills: Bill[] = useMemo(() => dbBills.map(mapRowToBill), [dbBills]);
+
+  // Mutations
+  const addBillMutation = useMutation({
+    mutationFn: async (newBill: Omit<Bill, "id" | "status">) => {
+      const insert = {
+        user_id: user!.id,
+        beneficiary: newBill.beneficiary,
+        amount: newBill.amount,
+        due_date: newBill.dueDate,
+        category: newBill.category ?? null,
+        barcode: newBill.barcode ?? null,
+        status: 'pending' as const,
+      };
+      const { data, error } = await supabase
+        .from('bills')
+        .insert(insert)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as Tables<'bills'>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bills', user?.id] });
+    }
+  });
+
+  const updateStatusMutation = useMutation({
+    mutationFn: async ({ billId, newStatus, paymentMethod }: { billId: string; newStatus: 'pending' | 'paid'; paymentMethod?: string }) => {
+      const patch: Partial<Tables<'bills'>> = { status: newStatus } as any;
+      if (newStatus === 'paid') {
+        patch.paid_at = new Date().toISOString().split('T')[0];
+        patch.payment_method = paymentMethod ?? null;
+      } else {
+        patch.paid_at = null;
+        patch.payment_method = null;
+      }
+      const { error } = await supabase
+        .from('bills')
+        .update(patch)
+        .eq('id', billId)
+        .eq('user_id', user!.id);
+      if (error) throw new Error(error.message);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bills', user?.id] });
+    }
+  });
+
+  const deleteBillMutation = useMutation({
+    mutationFn: async (billId: string) => {
+      const { error } = await supabase
+        .from('bills')
+        .delete()
+        .eq('id', billId)
+        .eq('user_id', user!.id);
+      if (error) throw new Error(error.message);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bills', user?.id] });
+    }
+  });
 
   const stats = useMemo(() => {
     const currentDate = new Date();
@@ -138,8 +235,8 @@ const Index = () => {
     const categoryMap = new Map<string, { amount: number; count: number }>();
     
     bills.forEach(bill => {
-      const current = categoryMap.get(bill.category) || { amount: 0, count: 0 };
-      categoryMap.set(bill.category, {
+      const current = categoryMap.get(bill.category) || { amount: 0, count: 0 } as { amount: number; count: number };
+      categoryMap.set(bill.category as string, {
         amount: current.amount + bill.amount,
         count: current.count + 1
       });
@@ -194,39 +291,15 @@ const Index = () => {
   };
 
   const handleBillStatusChange = (billId: string, newStatus: "pending" | "paid", paymentMethod?: string) => {
-    setBills(prev => prev.map(bill => {
-      if (bill.id === billId) {
-        const updatedBill = { ...bill, status: newStatus };
-        
-        if (newStatus === "paid") {
-          // Define a data atual como data de pagamento
-          updatedBill.paidAt = new Date().toISOString().split('T')[0];
-          if (paymentMethod) {
-            updatedBill.paymentMethod = paymentMethod as "PIX" | "Cartão de Crédito" | "Transferência Bancária";
-          }
-        } else {
-          // Remove data de pagamento e método se voltou para pending
-          delete updatedBill.paidAt;
-          delete updatedBill.paymentMethod;
-        }
-        
-        return updatedBill;
-      }
-      return bill;
-    }));
+    updateStatusMutation.mutate({ billId, newStatus, paymentMethod });
   };
 
   const handleDeleteBill = (billId: string) => {
-    setBills(prev => prev.filter(bill => bill.id !== billId));
+    deleteBillMutation.mutate(billId);
   };
 
   const handleAddBill = (newBill: Omit<Bill, "id" | "status">) => {
-    const bill: Bill = {
-      ...newBill,
-      id: Date.now().toString(),
-      status: "pending"
-    };
-    setBills(prev => [...prev, bill]);
+    addBillMutation.mutate(newBill);
   };
 
   const filteredBills = useMemo(() => {
@@ -243,12 +316,12 @@ const Index = () => {
   const paidBills = filteredBills.filter(bill => bill.status === "paid")
     .sort((a, b) => new Date(b.dueDate).getTime() - new Date(a.dueDate).getTime());
 
-  if (loading) {
+  if (loading || billsLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-center">
           <h2 className="text-xl font-semibold mb-2">Carregando...</h2>
-          <p className="text-muted-foreground">Verificando autenticação</p>
+          <p className="text-muted-foreground">Buscando suas contas</p>
         </div>
       </div>
     );
@@ -319,106 +392,79 @@ const Index = () => {
           <StatsCard
             title="Total a Pagar"
             value={formatCurrency(stats.totalPending)}
-            icon={DollarSign}
-            variant="warning"
-            trend={{
-              value: "12%",
-              isPositive: false
-            }}
+            icon={<DollarSign className="h-4 w-4" />}
+            description="Soma das contas pendentes"
           />
           <StatsCard
             title="Total Pago (Mês)"
             value={formatCurrency(stats.totalPaid)}
-            icon={CreditCard}
-            variant="success"
-            trend={{
-              value: "8%",
-              isPositive: true
-            }}
-          />
-          <StatsCard
-            title="Próximos Vencimentos"
-            value={stats.upcomingCount.toString()}
-            icon={Calendar}
-            variant="destructive"
+            icon={<CreditCard className="h-4 w-4" />}
+            description="Somente o mês atual"
           />
           <StatsCard
             title="Valor Total Pago Geral"
             value={formatCurrency(stats.totalPaidOverall)}
-            icon={TrendingUp}
-            variant="default"
+            icon={<TrendingUp className="h-4 w-4" />}
+            description="Desde o início"
+          />
+          <StatsCard
+            title="Próximos Vencimentos"
+            value={`${stats.upcomingCount}`}
+            icon={<Calendar className="h-4 w-4" />}
+            description="Nos próximos 7 dias"
           />
         </div>
 
-        {/* Charts */}
-        <div className="space-y-4 sm:space-y-6 lg:space-y-8 mb-6 sm:mb-8">
-          {/* Payment History Chart - Full Width */}
-          <div className="w-full">
-            <PaymentChart 
-              data={paymentHistoryData} 
-              selectedCategory={selectedCategory}
-              selectedMonth={selectedMonth}
-              onMonthSelect={setSelectedMonth}
-            />
-          </div>
-          
-          {/* Category Charts - Responsive Grid */}
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 sm:gap-6 lg:gap-8">
-            {/* Category Chart with flexible height */}
-            <div className="min-h-[350px] h-[400px] sm:h-[450px] xl:h-[500px]">
-              <CategoryChart data={categoryData} />
-            </div>
-            {/* Total Spending Chart with matching height */}
-            <div className="min-h-[350px] h-[400px] sm:h-[450px] xl:h-[500px]">
-              <TotalSpendingByCategory data={categoryData} paymentHistory={mockPaymentHistoryWithCategories} />
-            </div>
-          </div>
-        </div>
-
-        {/* Category Filter */}
-        <div className="mb-6">
-          <CategoryFilter
+        {/* Filters */}
+        <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between mb-6">
+          <CategoryFilter 
             categories={categories}
             selectedCategory={selectedCategory}
             onCategoryChange={setSelectedCategory}
+            selectedMonth={selectedMonth}
+            onMonthChange={setSelectedMonth}
           />
-          {selectedMonth && (
-            <div className="mt-2 flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">
-                Filtrado por mês: <strong>{selectedMonth}</strong>
-              </span>
-              <button
-                onClick={() => setSelectedMonth(null)}
-                className="text-xs text-primary hover:underline"
-              >
-                Limpar filtro
-              </button>
-            </div>
-          )}
         </div>
 
-        {/* Bills Lists */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6 lg:gap-8">
-          <div className="h-[400px] sm:h-[450px] md:h-[500px] lg:h-[550px]">
-            <BillsList
-              bills={pendingBills}
-              onBillStatusChange={handleBillStatusChange}
-              onBillDelete={handleDeleteBill}
-              title="Contas a Pagar"
-              showCheckbox={true}
-            />
+        {/* Content Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left Column */}
+          <div className="lg:col-span-2 space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <BillsList
+                title="A Pagar"
+                bills={pendingBills}
+                onBillStatusChange={handleBillStatusChange}
+                onBillDelete={handleDeleteBill}
+                showCheckbox
+              />
+              <BillsList
+                title="Pagas"
+                bills={paidBills}
+                onBillStatusChange={handleBillStatusChange}
+                onBillDelete={handleDeleteBill}
+                showCheckbox={false}
+              />
+            </div>
           </div>
-          <div className="h-[400px] sm:h-[450px] md:h-[500px] lg:h-[550px]">
-            <BillsList
-              bills={paidBills}
-              onBillStatusChange={handleBillStatusChange}
-              onBillDelete={handleDeleteBill}
-              title="Contas Pagas"
-              showCheckbox={false}
-            />
+
+          {/* Right Column */}
+          <div className="space-y-6">
+            <PaymentChart data={paymentHistoryData} />
+            <CategoryChart data={categoryData} />
+            <TotalSpendingByCategory data={categoryData} />
           </div>
         </div>
       </main>
+
+      {/* Footer */}
+      <footer className="border-t border-border py-4">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <p className="text-center text-sm text-muted-foreground">
+            © {new Date().getFullYear()} MeuBoleto AI. Todos os direitos reservados.
+          </p>
+        </div>
+      </footer>
     </div>
   );
 };
